@@ -1,5 +1,6 @@
 from time import perf_counter
-
+import numpy as np
+from numba import njit
 
 def get_tasks(path):
   tasks = []
@@ -39,89 +40,78 @@ def get_cmax(tasks, order):
 
   return int(currentEnd[-1])
 
-def neh(tasks):
-  if not tasks:
-    return []
+@njit(cache=True)
+def _qneh_numba_core(tasks):
+  n, m = tasks.shape
+  if n == 0:
+    return np.empty(0, dtype=np.int64)
 
-  ordered = sorted(range(len(tasks)), key=lambda idx: sum(tasks[idx]), reverse=True)
+  priorities = np.empty(n, dtype=np.int64)
+  for i in range(n):
+    row_sum = 0
+    for machine in range(m):
+      row_sum += tasks[i, machine]
+    priorities[i] = row_sum
 
-  res = [ordered[0]]
-  for task in ordered[1:]:
-    best_pos = 0
-    best_cmax = None
+  # Stable sort by descending priority, matching Python's sorted(..., reverse=True).
+  order = np.arange(n, dtype=np.int64)
+  for i in range(1, n):
+    key_idx = order[i]
+    key_priority = priorities[key_idx]
+    j = i - 1
+    while j >= 0 and priorities[order[j]] < key_priority:
+      order[j + 1] = order[j]
+      j -= 1
+    order[j + 1] = key_idx
+  pi = np.empty(n, dtype=np.int64)
+  pi_len = 1
+  pi[0] = order[0]
 
-    for j in range(len(res) + 1):
-      candidate = res[:j] + [task] + res[j:]
-      curr = get_cmax(tasks, candidate)
+  forward = np.zeros((n + 1, m), dtype=np.int64)
+  backwards = np.zeros((n + 1, m), dtype=np.int64)
 
-      if best_cmax is None or curr < best_cmax:
-        best_cmax = curr
-        best_pos = j
+  for idx in range(1, n):
+    job = order[idx]
+    job_t_0 = tasks[job, 0]
 
-    res = res[:best_pos] + [task] + res[best_pos:]
-
-  return res
-
-
-def qneh(tasks):
-  if not tasks:
-    return []
-
-  n = len(tasks)
-  m = len(tasks[0])
-
-  priorities = [sum(t) for t in tasks]
-  order = sorted(range(n), key=priorities.__getitem__, reverse=True)
-
-  pi = [order[0]]
-
-  forward = [[0] * m for _ in range(2)]
-  backwards = [[0] * m for _ in range(2)]
-
-  for job in order[1:]:
-    k = len(pi)
-
-    if k + 1 > len(forward):
-      forward.extend([[0] * m for _ in range(k + 1 - len(forward))])
-      backwards.extend([[0] * m for _ in range(k + 1 - len(backwards))])
-
-    job_t = tasks[job]
-    job_t_0 = job_t[0]
-
-    for i in range(1, k + 1):
-      task = tasks[pi[i - 1]]
-      prev = forward[i - 1]
-      curr = forward[i]
-
-      curr[0] = prev[0] + task[0]
+    for i in range(1, pi_len + 1):
+      task_idx = pi[i - 1]
+      forward[i, 0] = forward[i - 1, 0] + tasks[task_idx, 0]
 
       for machine in range(1, m):
-        curr[machine] = max(prev[machine], curr[machine - 1]) + task[machine]
+        prev = forward[i - 1, machine]
+        left = forward[i, machine - 1]
+        if prev > left:
+          forward[i, machine] = prev + tasks[task_idx, machine]
+        else:
+          forward[i, machine] = left + tasks[task_idx, machine]
 
-    for i in range(k - 1, -1, -1):
-      task = tasks[pi[i]]
-      nxt = backwards[i + 1]
-      curr = backwards[i]
-
-      task_m = task[m - 1]
-      curr[m - 1] = nxt[m - 1] + task_m
+    for i in range(pi_len - 1, -1, -1):
+      task_idx = pi[i]
+      backwards[i, m - 1] = backwards[i + 1, m - 1] + tasks[task_idx, m - 1]
 
       for machine in range(m - 2, -1, -1):
-        curr[machine] = max(nxt[machine], curr[machine + 1]) + task[machine]
+        nxt = backwards[i + 1, machine]
+        right = backwards[i, machine + 1]
+        if nxt > right:
+          backwards[i, machine] = nxt + tasks[task_idx, machine]
+        else:
+          backwards[i, machine] = right + tasks[task_idx, machine]
 
     best_pos = 0
-    best_cmax = float("inf")
+    best_cmax = 9223372036854775807
 
-    for pos in range(k + 1):
-      forward_pos = forward[pos]
-      backwards_pos = backwards[pos]
-
-      time = forward_pos[0] + job_t_0
-      cmax_val = time + backwards_pos[0]
+    for pos in range(pi_len + 1):
+      time_val = forward[pos, 0] + job_t_0
+      cmax_val = time_val + backwards[pos, 0]
 
       for machine in range(1, m):
-        time = max(time, forward_pos[machine]) + job_t[machine]
-        cmax_candidate = time + backwards_pos[machine]
+        if time_val < forward[pos, machine]:
+          time_val = forward[pos, machine] + tasks[job, machine]
+        else:
+          time_val = time_val + tasks[job, machine]
+
+        cmax_candidate = time_val + backwards[pos, machine]
         if cmax_candidate > cmax_val:
           cmax_val = cmax_candidate
 
@@ -129,9 +119,24 @@ def qneh(tasks):
         best_cmax = cmax_val
         best_pos = pos
 
-    pi.insert(best_pos, job)
+    for p in range(pi_len, best_pos, -1):
+      pi[p] = pi[p - 1]
 
-  return pi
+    pi[best_pos] = job
+    pi_len += 1
+
+  return pi[:pi_len]
+
+
+def qneh(tasks):
+  if not tasks:
+    return []
+
+  tasks_np = np.asarray(tasks, dtype=np.int64)
+  if tasks_np.ndim != 2:
+    raise ValueError("tasks must be a 2D array-like structure")
+  return _qneh_numba_core(tasks_np).tolist()
+
 
 
 if __name__ == "__main__":
