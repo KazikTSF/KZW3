@@ -1,7 +1,10 @@
-from time import perf_counter
 import csv
+from time import perf_counter
+
+import matplotlib.pyplot as plt
 import numpy as np
 from numba import njit
+
 
 def get_tasks(path):
   tasks = []
@@ -41,101 +44,6 @@ def get_cmax(tasks, order):
 
   return int(currentEnd[-1])
 
-@njit(cache=True)
-def _qneh_numba_core(tasks):
-  n, m = tasks.shape
-  if n == 0:
-    return np.empty(0, dtype=np.int64)
-
-  priorities = np.empty(n, dtype=np.int64)
-  for i in range(n):
-    row_sum = 0
-    for machine in range(m):
-      row_sum += tasks[i, machine]
-    priorities[i] = row_sum
-
-  order = np.arange(n, dtype=np.int64)
-  for i in range(1, n):
-    key_idx = order[i]
-    key_priority = priorities[key_idx]
-    j = i - 1
-    while j >= 0 and priorities[order[j]] < key_priority:
-      order[j + 1] = order[j]
-      j -= 1
-    order[j + 1] = key_idx
-  pi = np.empty(n, dtype=np.int64)
-  pi_len = 1
-  pi[0] = order[0]
-
-  forward = np.zeros((n + 1, m), dtype=np.int64)
-  backwards = np.zeros((n + 1, m), dtype=np.int64)
-
-  for idx in range(1, n):
-    job = order[idx]
-    job_t_0 = tasks[job, 0]
-
-    for i in range(1, pi_len + 1):
-      task_idx = pi[i - 1]
-      forward[i, 0] = forward[i - 1, 0] + tasks[task_idx, 0]
-
-      for machine in range(1, m):
-        prev = forward[i - 1, machine]
-        left = forward[i, machine - 1]
-        if prev > left:
-          forward[i, machine] = prev + tasks[task_idx, machine]
-        else:
-          forward[i, machine] = left + tasks[task_idx, machine]
-
-    for i in range(pi_len - 1, -1, -1):
-      task_idx = pi[i]
-      backwards[i, m - 1] = backwards[i + 1, m - 1] + tasks[task_idx, m - 1]
-
-      for machine in range(m - 2, -1, -1):
-        nxt = backwards[i + 1, machine]
-        right = backwards[i, machine + 1]
-        if nxt > right:
-          backwards[i, machine] = nxt + tasks[task_idx, machine]
-        else:
-          backwards[i, machine] = right + tasks[task_idx, machine]
-
-    best_pos = 0
-    best_cmax = 9223372036854775807
-
-    for pos in range(pi_len + 1):
-      time_val = forward[pos, 0] + job_t_0
-      cmax_val = time_val + backwards[pos, 0]
-
-      for machine in range(1, m):
-        if time_val < forward[pos, machine]:
-          time_val = forward[pos, machine] + tasks[job, machine]
-        else:
-          time_val = time_val + tasks[job, machine]
-
-        cmax_candidate = time_val + backwards[pos, machine]
-        if cmax_candidate > cmax_val:
-          cmax_val = cmax_candidate
-
-      if cmax_val < best_cmax:
-        best_cmax = cmax_val
-        best_pos = pos
-
-    for p in range(pi_len, best_pos, -1):
-      pi[p] = pi[p - 1]
-
-    pi[best_pos] = job
-    pi_len += 1
-
-  return pi[:pi_len]
-
-
-def qneh(tasks):
-  if len(tasks) == 0:
-    return []
-
-  tasks_np = np.asarray(tasks, dtype=np.int64)
-  if tasks_np.ndim != 2:
-    raise ValueError("tasks must be a 2D array-like structure")
-  return _qneh_numba_core(tasks_np).tolist()
 
 @njit(cache=True)
 def _get_cmax_numba(tasks, order, order_len):
@@ -163,132 +71,271 @@ def _get_cmax_numba(tasks, order, order_len):
 
   return int(currentEnd[-1])
 
+
 @njit(cache=True)
-def _neh_numba_core(tasks):
-  n, m = tasks.shape
+def _sa_numba_core(tasks, initial_order):
+  n = tasks.shape[0]
   if n == 0:
-    return np.empty(0, dtype=np.int64)
+    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
 
-  priorities = np.empty(n, dtype=np.int64)
-  for i in range(n):
-    row_sum = 0
-    for machine in range(m):
-      row_sum += tasks[i, machine]
-    priorities[i] = row_sum
+  current_order = initial_order.copy()
+  current_cmax = _get_cmax_numba(tasks, current_order, n)
 
-  order = np.arange(n, dtype=np.int64)
-  for i in range(1, n):
-    key_idx = order[i]
-    key_priority = priorities[key_idx]
-    j = i - 1
-    while j >= 0 and priorities[order[j]] < key_priority:
-      order[j + 1] = order[j]
-      j -= 1
-    order[j + 1] = key_idx
+  best_order = current_order.copy()
+  best_cmax = current_cmax
 
-  res = np.empty(n, dtype=np.int64)
-  candidate = np.empty(n, dtype=np.int64)
-  res[0] = order[0]
-  res_len = 1
+  temp = 5000.0
+  temp_mod = 0.9999
 
-  for idx in range(1, n):
-    job = order[idx]
-    best_pos = 0
-    best_cmax = 9223372036854775807
+  history = np.empty(100000, dtype=np.int64)
 
-    for pos in range(res_len + 1):
-      for p in range(pos):
-        candidate[p] = res[p]
-      candidate[pos] = job
-      for p in range(pos, res_len):
-        candidate[p + 1] = res[p]
+  for i in range(100001):
+    rand1 = np.random.randint(0, n)
+    rand2 = np.random.randint(0, n)
 
-      curr = _get_cmax_numba(tasks, candidate, res_len + 1)
-      if curr < best_cmax:
-        best_cmax = curr
-        best_pos = pos
+    new_order = current_order.copy()
+    val = new_order[rand1]
 
-    for p in range(res_len, best_pos, -1):
-      res[p] = res[p - 1]
-    res[best_pos] = job
-    res_len += 1
+    if rand1 < rand2:
+      new_order[rand1:rand2] = new_order[rand1 + 1:rand2 + 1]
+    elif rand1 > rand2:
+      new_order[rand2 + 1:rand1 + 1] = new_order[rand2:rand1]
 
-  return res[:res_len]
+    new_order[rand2] = val
+
+    new_cmax = _get_cmax_numba(tasks, new_order, n)
+
+    delta = new_cmax - current_cmax
+
+    if delta < 0 or np.random.random() < np.exp(-delta / temp):
+      current_order = new_order
+      current_cmax = new_cmax
+
+      if current_cmax < best_cmax:
+        best_cmax = current_cmax
+        best_order = current_order.copy()
+
+    temp *= temp_mod
+    history[i] = current_cmax
+
+  return best_order, history
 
 
-def neh(tasks):
+def ts(tasks, initial_order=None):
   if len(tasks) == 0:
     return []
 
   tasks_np = np.asarray(tasks, dtype=np.int64)
-  if tasks_np.ndim != 2:
-    raise ValueError("tasks must be a 2D array-like structure")
-  return _neh_numba_core(tasks_np).tolist()
+  n = tasks_np.shape[0]
+
+  if initial_order is None:
+    initial_order_np = np.arange(n, dtype=np.int64)
+  else:
+    initial_order_np = np.asarray(initial_order, dtype=np.int64)
+
+  best_order, _ = _ts_numba_core(tasks_np, initial_order_np)
+  return best_order.tolist()
+
+@njit(cache=True)
+def _ts_find_best_move(tasks, order):
+  n = order.shape[0]
+  best_move = np.array([0, 1], dtype=np.int64)
+  best_cmax = _get_cmax_numba(tasks, order, n)
+  
+  for i in range(n):
+    for j in range(n):
+      if i == j:
+        continue
+      new_order = order.copy()
+      element = new_order[i]
+      
+      if i < j:
+        new_order[i:j] = new_order[i + 1:j + 1]
+      else:
+        new_order[j + 1:i + 1] = new_order[j:i]
+      
+      new_order[j] = element
+      new_cmax = _get_cmax_numba(tasks, new_order, n)
+      
+      if new_cmax < best_cmax:
+        best_cmax = new_cmax
+        best_move = np.array([i, j], dtype=np.int64)
+  
+  return best_move
+
+@njit(cache=True)
+def _ts_add_move_tabu(move, order, tabu, tabu_size):
+  if tabu.shape[0] > 0:
+    if tabu.shape[0] >= tabu_size:
+      tabu[:-1] = tabu[1:]
+    
+    job = order[move[1]]
+    tabu[-1, 0] = job
+    tabu[-1, 1] = move[1]
+
+
+@njit(cache=True)
+def _ts_step(tasks, order, tabu, tabu_size):
+  move = _ts_find_best_move(tasks, order)
+  _ts_add_move_tabu(move, order, tabu, tabu_size)
+
+  i = move[0]
+  j = move[1]
+  element = order[i]
+  
+  if i < j:
+    order[i:j] = order[i + 1:j + 1]
+  else:
+    order[j + 1:i + 1] = order[j:i]
+  
+  order[j] = element
+  return order
+
+
+@njit(cache=True)
+def _ts_numba_core(tasks, initial_order):
+  n = tasks.shape[0]
+  if n == 0:
+    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+  
+  tabu_size = 10
+
+  current_order = initial_order.copy()
+  current_cmax = _get_cmax_numba(tasks, current_order, n)
+  
+  best_order = current_order.copy()
+  best_cmax = current_cmax
+
+  tabu = np.zeros((tabu_size, 2), dtype=np.int64)
+
+  history = np.empty(101, dtype=np.int64)
+  history[0] = current_cmax
+  
+  for i in range(101):
+    _ts_step(tasks, current_order, tabu, tabu_size)
+    current_cmax = _get_cmax_numba(tasks, current_order, n)
+    history[i] = current_cmax
+    
+    if current_cmax < best_cmax:
+      best_cmax = current_cmax
+      best_order = current_order.copy()
+  
+  return best_order, history
+  
+
+
+def simulated(tasks, initial_order=None):
+  if len(tasks) == 0:
+    return [], []
+
+  tasks_np = np.asarray(tasks, dtype=np.int64)
+  n = tasks_np.shape[0]
+
+  if initial_order is None:
+    initial_order_np = np.arange(n, dtype=np.int64)
+  else:
+    initial_order_np = np.asarray(initial_order, dtype=np.int64)
+
+  best_order, history = _sa_numba_core(tasks_np, initial_order_np)
+  return best_order.tolist(), history.tolist()
+
+
+def tabu(tasks, initial_order=None):
+  if len(tasks) == 0:
+    return [], []
+
+  tasks_np = np.asarray(tasks, dtype=np.int64)
+  n = tasks_np.shape[0]
+
+  if initial_order is None:
+    initial_order_np = np.arange(n, dtype=np.int64)
+  else:
+    initial_order_np = np.asarray(initial_order, dtype=np.int64)
+
+  best_order, history = _ts_numba_core(tasks_np, initial_order_np)
+  return best_order.tolist(), history.tolist()
 
 
 if __name__ == "__main__":
-  total_qneh_time = 0.0
-  total_neh_time = 0.0
+  total_sa_time = 0.0
+  total_ts_time = 0.0
 
-  csv_path = "benchmark_results.csv"
-  with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
-    writer = csv.writer(csv_file)
-    writer.writerow([
-      "input_id",
-      "filename",
-      "n",
-      "machines",
-      "qneh_time_s",
-      "neh_time_s",
-      "qneh_cmax",
-      "neh_cmax",
-      "qneh_order",
-      "neh_order",
-    ])
+  sa_history_path = "sa_iterations.csv"
+  ts_history_path = "ts_iterations.csv"
 
-    for i in range(121):
-      filename = f"data/data{i}.txt"
-      tasksInput = get_tasks(filename)
-      n = len(tasksInput)
-      machines = len(tasksInput[0]) if tasksInput else 0
-
-      print("=" * 20)
-      print("Calculating data " + str(i))
-
-      start = perf_counter()
-      qneh_order = qneh(tasksInput)
-      qneh_elapsed = perf_counter() - start
-      total_qneh_time += qneh_elapsed
-      qneh_cmax = get_cmax(tasksInput, qneh_order)
-
-      start = perf_counter()
-      neh_order = neh(tasksInput)
-      neh_elapsed = perf_counter() - start
-      total_neh_time += neh_elapsed
-      neh_cmax = get_cmax(tasksInput, neh_order)
-
-      print(f"qneh order: {qneh_order}")
-      print(f"qneh cmax: {qneh_cmax}")
-      print(f"qneh time: {qneh_elapsed:.6f} s")
-      print(f"neh order: {neh_order}")
-      print(f"neh cmax: {neh_cmax}")
-      print(f"neh time: {neh_elapsed:.6f} s")
-
-      writer.writerow([
-        i,
-        filename,
-        n,
-        machines,
-        f"{qneh_elapsed:.9f}",
-        f"{neh_elapsed:.9f}",
-        qneh_cmax,
-        neh_cmax,
-        " ".join(map(str, qneh_order)),
-        " ".join(map(str, neh_order)),
-      ])
+  input_file = "data/data80.txt"
+  tasksInput = get_tasks(input_file)
+  n = len(tasksInput)
+  machines = len(tasksInput[0]) if tasksInput else 0
 
   print("=" * 20)
-  print(f"Total qneh time: {total_qneh_time:.6f} s")
-  print(f"Total neh time: {total_neh_time:.6f} s")
-  print(f"CSV saved to: {csv_path}")
+  print("Calculating data for " + input_file)
 
+  # Simulated Annealing
+  with open(sa_history_path, "w", newline="",
+            encoding="utf-8") as sa_history_file:
+    history_writer = csv.writer(sa_history_file)
+    history_writer.writerow(["iteration", "cmax"])
+
+    start = perf_counter()
+    sa_order, sa_history = simulated(tasksInput, list(range(n)))
+    sa_elapsed = perf_counter() - start
+    total_sa_time += sa_elapsed
+    sa_cmax = get_cmax(tasksInput, sa_order)
+
+    print("\n--- Simulated Annealing ---")
+    print(f"sa order: {sa_order}")
+    print(f"sa cmax: {sa_cmax}")
+    print(f"sa time: {sa_elapsed:.6f} s")
+
+    sa_iterations_plot = []
+    sa_cmax_plot = []
+
+    for i, cmax in enumerate(sa_history):
+      if i % 200 == 0:
+        history_writer.writerow([i, cmax])
+        sa_iterations_plot.append(i)
+        sa_cmax_plot.append(cmax)
+
+  # Tabu Search
+  with open(ts_history_path, "w", newline="",
+            encoding="utf-8") as ts_history_file:
+    history_writer = csv.writer(ts_history_file)
+    history_writer.writerow(["iteration", "cmax"])
+
+    start = perf_counter()
+    ts_order, ts_history = tabu(tasksInput, list(range(n)))
+    ts_elapsed = perf_counter() - start
+    total_ts_time += ts_elapsed
+    ts_cmax = get_cmax(tasksInput, ts_order)
+
+    print("\n--- Tabu Search ---")
+    print(f"ts order: {ts_order}")
+    print(f"ts cmax: {ts_cmax}")
+    print(f"ts time: {ts_elapsed:.6f} s")
+
+    ts_iterations_plot = []
+    ts_cmax_plot = []
+
+    for i, cmax in enumerate(ts_history):
+      history_writer.writerow([i, cmax])
+      ts_iterations_plot.append(i)
+      ts_cmax_plot.append(cmax)
+
+  plt.figure(figsize=(12, 6))
+  plt.plot(ts_iterations_plot, ts_cmax_plot, label="Tabu Search CMAX",
+           color="red", marker='s', markersize=3)
+  plt.title("TS Iterations vs CMAX")
+  plt.xlabel("Iteration")
+  plt.ylabel("CMAX")
+  plt.grid(True)
+  plt.legend()
+  chart_path = "ts_iterations_chart.png"
+  plt.savefig(chart_path)
+  print(f"\nComparison chart saved to: {chart_path}")
+
+  print("=" * 20)
+  print(f"Total SA time: {total_sa_time:.6f} s")
+  print(f"Total TS time: {total_ts_time:.6f} s")
+  print(f"SA iterations CSV saved to: {sa_history_path}")
+  print(f"TS iterations CSV saved to: {ts_history_path}")
